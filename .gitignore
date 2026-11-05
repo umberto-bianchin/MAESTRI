@@ -1,0 +1,22 @@
+.DS_Store
+.vscode/
+.claude/
+__pycache__/
+*.pyc
+
+# LCM: built from source by `make`, plus its scratch files
+MAESTRI/lcm53/lcm
+MAESTRI/lcm53/lcm-out*
+MAESTRI/lcm53/table-file*
+MAESTRI/lcm53/__tmp*
+MAESTRI/lcm53/.build.lock
+MAESTRI/lcm53/*.o
+
+# TRACERx: raw release (academic-use licence, download it, see data/TRACERx/README.md)
+# and the intermediate preprocessing outputs
+data/TRACERx/original_data/
+data/TRACERx/processed_data/
+data/TRACERx/data_tracerx/
+
+# Results
+MAESTRI/results

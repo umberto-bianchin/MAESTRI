@@ -1,0 +1,625 @@
+"""End-to-end runner for the MAESTRI multi-tree pipeline.
+
+Given a dataset (either a .npy object array indexed data[patient][tree][edge] =
+[parent, child], or a pre-built graphs .txt plus an owner file), this script
+builds the transaction inputs and mines these families of trajectories:
+
+  single-tree baseline   one tree per patient is sampled at random and mined
+                         with unweighted frequent-itemset mining (alg0).
+  expected support       all candidate trees are pooled, each weighted by 1/M_i
+                         (M_i is the number of trees of patient i), and mined
+                         with weighted frequent-itemset mining (alg1).
+  theta-frequent         post-filter on the expected-support family, one per
+                         theta (alg2).
+  theta-maximal          the theta-frequent family reduced to its maximal
+                         elements, one per theta (alg3).
+
+The mined families are then compared (Jaccard similarity, per-method unique
+patterns). With --significance every family is scored under the multi-tree null
+(compute_significance_multitree.py): the expected-support test on the baseline and
+the expected-support family, the theta-consensus test on the theta families.
+With --single_tree_only only the baseline is built, mined and scored; the
+seed-independent multi-tree families are skipped, which is useful to repeat the
+baseline over many seeds.
+
+The LCM mining and the filtering of each family are skipped when their output
+file already exists, so rerunning with the same --outdir does not mine again;
+transnum, the theta post-filters, the comparison and the significance tests
+are always recomputed.
+
+Example:
+  python3 run_pipeline.py --npy ../data/breastCancer.npy --sigma 5 --seed 0 \\
+      --theta_list 0.5,1.0 --significance --sig_null perm
+"""
+
+import argparse
+import json
+from pathlib import Path
+from typing import Optional
+from datetime import datetime
+import numpy as np
+from utils import (
+    PYTHON,
+    SCRIPT_DIR,
+    ensure_dir,
+    run_cmd,
+    load_npy,
+    build_inputs,
+    run_transnum,
+    run_lcm,
+    read_result_itemsets,
+    compute_dataset_stats,
+    read_floats,
+    load_weights_and_owner,
+)
+import shutil
+
+# -------------------------
+# Run pipelines
+# -------------------------
+def run_pipeline(graphs_txt: Path, sigma: float, lcmdir: Path, workdir: Path, tag: str, weights_txt: Optional[Path] = None, weighted: bool = False):
+    """Mine one family: frequent itemsets over one tree per patient, or all trees
+
+    Steps:  transnum -> LCM (with -w when weighted) -> convert_results -> filter_results
+    """
+    ensure_dir(workdir)
+
+    # LCM scratch files live in this run's workdir (not the shared lcmdir), so
+    # independent pipelines can mine from the same folder in parallel without
+    # clobbering each other's table-file / lcm-out intermediates.
+    table_file_ids = workdir / f"table-file-{graphs_txt.name}"
+    file_graphs_ids = workdir / f"lcm-out-{graphs_txt.stem}_ids.txt"
+    output_lcm = workdir / f"lcm-out-{graphs_txt.name}"
+
+    results_converted = workdir / f"{tag}_convres.txt"
+    results_filtered = workdir / f"{tag}_filtered.txt"
+
+    run_transnum(lcmdir, table_file_ids, graphs_txt, file_graphs_ids)
+
+    log_path = workdir / f"{tag}_lcm.log"
+
+    if results_converted.exists():
+        print(f"[SKIP] {results_converted.name} already exists - skipping run_lcm")
+    else:
+        if weighted:
+            run_lcm(lcmdir, file_graphs_ids, sigma, output_lcm, log_path, weights_txt=weights_txt)
+        else:
+            run_lcm(lcmdir, file_graphs_ids, sigma, output_lcm, log_path, weights_txt=None)
+
+        tmp_converted = results_converted.with_name(results_converted.name + ".tmp")
+        run_cmd([PYTHON, str(SCRIPT_DIR / "convert_results.py"),
+                 "-m", str(table_file_ids), "-i", str(output_lcm), "-o", str(tmp_converted)])
+        tmp_converted.replace(results_converted)
+
+    if results_filtered.exists():
+        print(f"[SKIP] {results_filtered.name} already exists - skipping filter_results")
+    else:
+        tmp_filtered = results_filtered.with_name(results_filtered.name + ".tmp")
+        run_cmd([PYTHON, str(SCRIPT_DIR / "filter_results.py"),
+                 "-i", str(results_converted), "-o", str(tmp_filtered)])
+        tmp_filtered.replace(results_filtered)
+
+    return results_filtered
+
+def run_postfilters(expected_filtered: Path, weights_txt: Path, owner_txt: Path, theta: float, st: int, workdir: Path, tag: str):
+    """Apply both theta post-filters to an already-filtered expected-support family
+
+    Runs the theta-frequent filter and the theta-maximal one, returning the
+    paths to both output files
+    """
+    out_alg2 = workdir / f"{tag}_alg2_theta{theta}_st{st}.txt"
+    out_alg3 = workdir / f"{tag}_alg3_theta{theta}_st{st}.txt"
+
+    run_cmd([PYTHON, str(SCRIPT_DIR / "postfilter_theta.py"),
+             "-i", str(expected_filtered),
+             "-o", str(out_alg2),
+             "-w", str(weights_txt),
+             "-owner", str(owner_txt),
+             "-theta", str(theta),
+             "-st", str(st)])
+
+    run_cmd([PYTHON, str(SCRIPT_DIR / "postfilter_theta.py"),
+             "-i", str(expected_filtered),
+             "-o", str(out_alg3),
+             "-w", str(weights_txt),
+             "-owner", str(owner_txt),
+             "-theta", str(theta),
+             "-st", str(st),
+             "--maximal"])
+
+    return out_alg2, out_alg3
+
+
+# -------------------------
+# Significance stage
+# -------------------------
+def _run_sig(input_path, output_path, npy_path, graphs_all_path,
+             weights_txt, owner_txt,
+             test, null_model, mc_cutoff, mc_samples, seed, theta=None, n_jobs=1,
+             exact_when_cheaper=False):
+    """Invoke compute_significance_multitree.py for one (filtered file, test) pair"""
+    cmd = [
+        PYTHON, str(SCRIPT_DIR / "compute_significance_multitree.py"),
+        "-i", str(input_path),
+        "-o", str(output_path),
+        "-w", str(weights_txt),
+        "--owner", str(owner_txt),
+        "--test", test,
+        "--null", null_model,
+        "--mc_cutoff", str(mc_cutoff),
+        "--mc_samples", str(mc_samples),
+        "--seed", str(seed),
+        "--n_jobs", str(n_jobs),
+    ]
+    if npy_path is not None:
+        cmd += ["--npy", str(npy_path)]
+    else:
+        cmd += ["--graphs_all", str(graphs_all_path)]
+    if theta is not None:
+        cmd += ["--theta", str(theta)]
+    if exact_when_cheaper:
+        cmd.append("--exact_when_cheaper")
+    run_cmd(cmd)
+
+
+def run_significance_tests(sig_dir, npy_path, npy_sampled_path,
+                           graphs_all_path, graphs_sampled_path,
+                           weights_txt, owner_txt,
+                           weights_sampled_txt, owner_sampled_txt,
+                           alg0_filtered, alg1_filtered, alg2_paths, alg3_paths,
+                           thetas, null_model, mc_cutoff, mc_samples, seed, n_jobs=1,
+                           single_tree_only=False, exact_when_cheaper=False):
+    """Run significance tests on every pipeline output
+
+    The baseline uses the sampled weights/owner (1.0 per patient, one transaction
+    per patient); the multi-tree families use the weights/owner of all trees
+    (1/M_i per tree by default, M_i transactions per patient)
+
+    Either npy_path or graphs_all_path must be set (not both)
+    """
+    jobs = []
+
+    # single-tree baseline -> expected-support test, with its own weights/owner
+    out = sig_dir / "alg0_mastro_random_pvalues_exp.csv"
+    jobs.append(dict(
+        input_path=alg0_filtered, output_path=out,
+        npy_path=npy_sampled_path,
+        graphs_all_path=graphs_sampled_path,
+        weights_txt=weights_sampled_txt, owner_txt=owner_sampled_txt,
+        test="exp", null_model=null_model,
+        mc_cutoff=mc_cutoff, mc_samples=mc_samples, seed=seed,
+    ))
+
+    if single_tree_only:
+        # Only the single-tree baseline is scored; skip the multi-tree families.
+        print(f"[INFO] Running {len(jobs)} significance test (single-tree only), "
+              f"{n_jobs} workers")
+        for j in jobs:
+            _run_sig(n_jobs=n_jobs, exact_when_cheaper=exact_when_cheaper, **j)
+        return
+
+    # expected-support family -> expected-support test, with weights/owner of all trees
+    out = sig_dir / "alg1_expected_uniform_pvalues_exp.csv"
+    jobs.append(dict(
+        input_path=alg1_filtered, output_path=out,
+        npy_path=npy_path,
+        graphs_all_path=graphs_all_path,
+        weights_txt=weights_txt, owner_txt=owner_txt,
+        test="exp", null_model=null_model,
+        mc_cutoff=mc_cutoff, mc_samples=mc_samples, seed=seed,
+    ))
+
+    # the two theta families -> theta-consensus test, once per theta
+    for th in thetas:
+        for prefix, paths in [("alg2", alg2_paths), ("alg3", alg3_paths)]:
+            key = f"{prefix}_theta{th}"
+            if key not in paths:
+                continue
+            out = sig_dir / f"{key}_pvalues_theta.csv"
+            jobs.append(dict(
+                input_path=paths[key], output_path=out,
+                npy_path=npy_path,
+                graphs_all_path=graphs_all_path,
+                weights_txt=weights_txt, owner_txt=owner_txt,
+                test="theta", null_model=null_model,
+                mc_cutoff=mc_cutoff, mc_samples=mc_samples, seed=seed,
+                theta=th,
+            ))
+
+    # Each significance job is itself parallel over trajectories (--n_jobs),
+    # so we run the (few) jobs sequentially and give every job the full worker
+    # budget rather than fanning out the handful of CSVs across a shallow pool.
+    print(f"[INFO] Running {len(jobs)} significance tests, {n_jobs} workers each")
+    for j in jobs:
+        _run_sig(n_jobs=n_jobs, exact_when_cheaper=exact_when_cheaper, **j)
+
+# -------------------------
+# Result comparison
+# -------------------------
+def compare_results(result_paths: dict, outdir: Path):
+    """Compare mined pattern sets across all algorithm variants
+
+    Outputs:
+      - comparison_summary.json : pattern count per method
+      - pairwise_jaccard.csv    : Jaccard similarity for every method pair
+      - unique_patterns.txt     : patterns found exclusively by each method
+    """
+    sets = {name: set(read_result_itemsets(p)) for name, p in result_paths.items()}
+    summary = {name: {"n_patterns": len(s)} for name, s in sets.items()}
+
+    names = list(sets.keys())
+    rows = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            A, B = sets[a], sets[b]
+            inter = len(A & B)
+            uni = len(A | B)
+            jac = (inter / uni) if uni else 1.0
+            rows.append({"A": a, "B": b, "intersection": inter, "union": uni, "jaccard": jac})
+
+    (outdir / "comparison_summary.json").write_text(json.dumps(summary, indent=2))
+
+    csv_path = outdir / "pairwise_jaccard.csv"
+    with csv_path.open("w") as f:
+        f.write("A,B,intersection,union,jaccard\n")
+        for r in rows:
+            f.write(f"{r['A']},{r['B']},{r['intersection']},{r['union']},{r['jaccard']}\n")
+
+    uniq_path = outdir / "unique_patterns.txt"
+    with uniq_path.open("w") as f:
+        for name in names:
+            others = set().union(*[sets[n] for n in names if n != name]) if len(names) > 1 else set()
+            only = sets[name] - others
+            f.write(f"## Only in {name}: {len(only)} patterns\n")
+            for it in sorted(only, key=lambda x: (len(x), sorted(list(x)))):
+                f.write("  - " + " ".join(sorted(it)) + "\n")
+            f.write("\n")
+
+    print("[OK] Wrote:", outdir / "comparison_summary.json", csv_path, uniq_path)
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    input_grp = ap.add_mutually_exclusive_group(required=True)
+    input_grp.add_argument("--npy", help="Path to .npy dataset (object array data[patient][tree][edge]=[parent,child])")
+    input_grp.add_argument("--graphs", help="Path to a .txt file where each line is a pre-computed transaction")
+    ap.add_argument("--owner", default=None,
+                    help="Owner file for --graphs mode: one patient-ID per line (same #lines as graphs). "
+                         "If omitted, each line is treated as a separate patient (1 tree per patient)")
+    ap.add_argument("--weights", default=None,
+                    help="Per-tree weights, one float per line in the order of "
+                         "inputs/graphs_all.txt (patients in input order, each "
+                         "patient's trees in order; a patient without trees "
+                         "contributes no line). The weights of each patient must "
+                         "be >= 0 and sum to 1. Default: uniform 1/M_i. The "
+                         "weights actually used are written to inputs/weights.txt")
+    ap.add_argument("--sigma", type=int, default=10, help="Support threshold sigma")
+    ap.add_argument("--seed", type=int, default=0, help="Random seed for picking one tree per patient")
+    ap.add_argument("--theta_list", default="0.25,0.5,0.75,1.0", help="Comma-separated list of theta values")
+    ap.add_argument("--min_mine_sigma", type=int, default=None,
+                    help="Lower bound on the candidate mining threshold for the "
+                         "theta-consensus family. The correctness rule is "
+                         "sigma_exp = floor(theta*sigma); when it falls "
+                         "below this bound the theta family is mined at sigma "
+                         "instead. A value of 2 avoids the sigma=1 blow-up; "
+                         "must match the value passed to "
+                         "run_wy_correction_multitree.py so observed and null "
+                         "families agree.")
+    ap.add_argument("--lcmdir", default=str(SCRIPT_DIR / "lcm53"),
+                    help="Path to lcm53 directory (default: lcm53 next to this script)")
+    ap.add_argument("--outdir", default=None, help="Output directory (default: results_<timestamp>)")
+    ap.add_argument("--keep_gl", action="store_true", help="Keep GL in stats and transactions")
+    ap.add_argument("--significance", action="store_true",
+                    help="Run the multi-tree significance tests after mining "
+                         "(expected-support test on the baseline and the "
+                         "expected-support family, theta-consensus test on the "
+                         "two theta families)")
+    ap.add_argument("--single_tree_only", action="store_true",
+                    help="Only build/mine/score the single-tree baseline. "
+                         "Skips the seed-independent multi-tree families "
+                         "and their significance; useful to repeat the "
+                         "baseline over many seeds.")
+    ap.add_argument("--sig_null", choices=["indep", "perm"], default="perm",
+                    help="Null model for significance testing (default: perm)")
+    ap.add_argument("--sig_mc_cutoff", type=int, default=8,
+                    help="M_i above which to use MC in significance testing")
+    ap.add_argument("--sig_mc_samples", type=int, default=10000,
+                    help="Monte-Carlo samples per patient in significance testing")
+    ap.add_argument("--sig_exact_when_cheaper", action="store_true",
+                    help="Exact enumeration above --sig_mc_cutoff when there "
+                         "are at most --sig_mc_samples placements")
+    ap.add_argument("--sig_n_jobs", type=int, default=1,
+                    help="Parallel workers over trajectories in significance "
+                         "testing (default 1 = sequential)")
+    args = ap.parse_args()
+    if args.keep_gl and args.significance:
+        ap.error("--keep_gl cannot be combined with --significance: the significance "
+                 "test drops the germline GL, and the 'perm' null would relabel GL "
+                 "as an alteration")
+
+    lcmdir = Path(args.lcmdir).resolve()
+    drop_gl = not args.keep_gl
+
+    if args.outdir is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        outdir = Path(f"results_{ts}").resolve()
+    else:
+        outdir = Path(args.outdir).resolve()
+    ensure_dir(outdir)
+
+    inputs_dir = outdir / "inputs"
+    ensure_dir(inputs_dir)
+
+    npy_path = None
+    npy_sampled_path = None
+
+    if args.npy:
+        npy_path = Path(args.npy).resolve()
+        data = load_npy(npy_path)
+        patients_trees = list(data)
+
+        stats = compute_dataset_stats(patients_trees, drop_gl=drop_gl)
+        (outdir / "dataset_stats.json").write_text(json.dumps(stats, indent=2))
+        print("[OK] Dataset stats written to", outdir / "dataset_stats.json")
+
+        graphs_all, weights_uniform, owner_txt, graphs_sampled = build_inputs(
+            patients_trees, inputs_dir, seed=args.seed, drop_gl=drop_gl
+        )
+
+        # The single-tree baseline is scored with one tree per patient, weight
+        # 1.0, so the significance test sees the sampled trees, not all of them.
+        # sampled.npy repeats build_inputs' draw (same seed, same order of
+        # rng.integers calls); the two must stay in sync, or the scored trees
+        # would differ from the mined graphs_sampled.txt.
+        weights_sampled_txt = inputs_dir / "weights_sampled.txt"
+        owner_sampled_txt = inputs_dir / "owner_sampled.txt"
+        with weights_sampled_txt.open("w") as fw, owner_sampled_txt.open("w") as fo:
+            for i, tlist in enumerate(patients_trees):
+                if len(tlist) == 0:
+                    continue
+                fw.write("1.0\n")
+                fo.write(f"{i}\n")
+
+        npy_sampled_path = inputs_dir / "sampled.npy"
+        rng_sample = np.random.default_rng(args.seed)
+        n = len(patients_trees)
+        sampled_data = np.empty(n, dtype=object)
+        for i, tlist in enumerate(patients_trees):
+            if len(tlist) == 0:
+                sampled_data[i] = np.empty((0, 2), dtype=object)
+                continue
+            j = int(rng_sample.integers(0, len(tlist)))
+            sampled_data[i] = np.array([tlist[j]], dtype=object)
+        np.save(npy_sampled_path, sampled_data, allow_pickle=True)
+        print(f"[OK] Sampled .npy with 1 tree/patient written to {npy_sampled_path}")
+
+    else:
+        graphs_src = Path(args.graphs).resolve()
+        lines = [l.rstrip("\n") for l in graphs_src.open()]
+        n_lines = len(lines)
+
+        if args.owner:
+            owner_ids = [l.strip() for l in open(args.owner)]
+            assert len(owner_ids) == n_lines, (
+                f"owner file has {len(owner_ids)} lines but graphs has {n_lines}")
+            # Map owner labels -> 0-based patient indices (preserve order of first appearance)
+            label_to_idx = {}
+            for lab in owner_ids:
+                if lab not in label_to_idx:
+                    label_to_idx[lab] = len(label_to_idx)
+            owner_ints = [label_to_idx[lab] for lab in owner_ids]
+        else:
+            # 1 tree per patient
+            owner_ints = list(range(n_lines))
+
+        n_patients = max(owner_ints) + 1
+        # Group lines by patient
+        patient_lines = [[] for _ in range(n_patients)]
+        for idx, line in zip(owner_ints, lines):
+            patient_lines[idx].append(line)
+
+        # Write graphs_all.txt, weights, owner
+        graphs_all = inputs_dir / "graphs_all.txt"
+        weights_uniform = inputs_dir / "weights_uniform.txt"
+        owner_txt = inputs_dir / "owner.txt"
+        with graphs_all.open("w") as fg, weights_uniform.open("w") as fw, owner_txt.open("w") as fo:
+            for pid, plines in enumerate(patient_lines):
+                Mi = len(plines)
+                w = 1.0 / Mi
+                for line in plines:
+                    fg.write(line + "\n")
+                    fw.write(f"{w}\n")
+                    fo.write(f"{pid}\n")
+
+        # Write graphs_sampled.txt (one random tree per patient)
+        graphs_sampled = inputs_dir / "graphs_sampled.txt"
+        rng_sample = np.random.default_rng(args.seed)
+        with graphs_sampled.open("w") as fs:
+            for plines in patient_lines:
+                j = int(rng_sample.integers(0, len(plines)))
+                fs.write(plines[j] + "\n")
+
+        # Sampled weights/owner (1 per patient, weight=1.0)
+        weights_sampled_txt = inputs_dir / "weights_sampled.txt"
+        owner_sampled_txt = inputs_dir / "owner_sampled.txt"
+        with weights_sampled_txt.open("w") as fw, owner_sampled_txt.open("w") as fo:
+            for pid in range(n_patients):
+                fw.write("1.0\n")
+                fo.write(f"{pid}\n")
+
+        # Basic stats for .txt mode
+        stats = {
+            "n_patients": n_patients,
+            "n_transactions": n_lines,
+            "trees_per_patient": {
+                "min": int(min(len(pl) for pl in patient_lines)),
+                "median": float(np.median([len(pl) for pl in patient_lines])),
+                "max": int(max(len(pl) for pl in patient_lines)),
+                "mean": float(np.mean([len(pl) for pl in patient_lines])),
+            },
+            "input_mode": "graphs_txt",
+        }
+        (outdir / "dataset_stats.json").write_text(json.dumps(stats, indent=2))
+        print(f"[OK] Loaded {n_lines} transactions for {n_patients} patients from {graphs_src.name}")
+
+    # Per-tree weights: uniform unless --weights is given. The weights actually
+    # used are written to inputs/weights.txt, which the run scripts pass to the
+    # WY step so that the observed and the null families use the same weights
+    weights_txt = inputs_dir / "weights.txt"
+    if args.weights:
+        w = read_floats(Path(args.weights))
+        _, owner0, n_pat, K = load_weights_and_owner(weights_uniform, owner_txt)
+        if len(w) != K:
+            ap.error(f"--weights has {len(w)} lines but the input has {K} trees")
+        if min(w) < 0:
+            ap.error("--weights must be >= 0")
+        tot = [0.0] * n_pat
+        for t, x in enumerate(w):
+            tot[owner0[t]] += x
+        bad = sorted(i for i in set(owner0) if abs(tot[i] - 1.0) > 1e-6)
+        if bad:
+            ap.error(f"--weights of {len(bad)} patients do not sum to 1 "
+                     f"(e.g. patient {bad[0]}: {tot[bad[0]]:.6f})")
+        weights_txt.write_text("".join(f"{x!r}\n" for x in w))
+    else:
+        shutil.copyfile(weights_uniform, weights_txt)
+
+    runs_dir = outdir / "runs"
+    ensure_dir(runs_dir)
+
+    sigma = args.sigma
+    thetas = [float(x.strip()) for x in args.theta_list.split(",") if x.strip()]
+
+    # --- single-tree baseline: random sampling, unweighted FIM ---
+    alg0_dir = runs_dir / "alg0_mastro_random"
+    alg0_filtered = run_pipeline(
+        graphs_txt=graphs_sampled,
+        sigma=sigma,
+        lcmdir=lcmdir,
+        workdir=alg0_dir,
+        tag="mastro_random"
+    )
+
+    alg1_filtered = None
+    alg2_paths = {}
+    alg3_paths = {}
+
+    if not args.single_tree_only:
+        # --- expected support: all trees, weighted FIM ---
+        alg1_dir = runs_dir / "alg1_expected_uniform"
+        alg1_filtered = run_pipeline(
+            graphs_txt=graphs_all,
+            sigma=float(sigma),
+            lcmdir=lcmdir,
+            workdir=alg1_dir,
+            tag="expected_uniform",
+            weights_txt=weights_txt,
+            weighted=True
+        )
+
+        # --- theta-frequent / theta-maximal post-filters ---
+        alg23_dir = runs_dir / "alg2_alg3_postfilters"
+        ensure_dir(alg23_dir)
+
+        # The theta-consensus family must be mined at the candidate threshold
+        # sigma_exp = floor(theta * sigma), not at sigma: otherwise
+        # theta-frequent trajectories whose expected support falls in
+        # [theta*sigma, sigma) are silently dropped. For theta = 1 the two
+        # thresholds coincide and the expected-support family is reused.
+        # Lowering the mining threshold enlarges the candidate set very fast, so
+        # when floor(theta*sigma) drops below --min_mine_sigma the mining is not
+        # tractable: fall back to sigma and warn that the family may be
+        # incomplete. int(th * sigma) floors the float product, so a product
+        # just below an integer (e.g. 0.57 * 100) rounds down one step.
+        alg1_low_cache = {}  # sigma_c -> filtered candidate path (reused across thetas)
+        for th in thetas:
+            sigma_c = max(1, int(th * sigma))
+            if sigma_c >= sigma:
+                cand = alg1_filtered
+            elif args.min_mine_sigma is not None and sigma_c < args.min_mine_sigma:
+                cand = alg1_filtered
+                print(f"[WARN] theta={th}: correct candidate threshold "
+                      f"sigma_exp={sigma_c} is below --min_mine_sigma="
+                      f"{args.min_mine_sigma}; mining the theta family at sigma="
+                      f"{sigma} instead. This family may be incomplete.",
+                      flush=True)
+            else:
+                if sigma_c not in alg1_low_cache:
+                    low_dir = runs_dir / f"alg1_expected_uniform_sig{sigma_c}"
+                    alg1_low_cache[sigma_c] = run_pipeline(
+                        graphs_txt=graphs_all,
+                        sigma=float(sigma_c),
+                        lcmdir=lcmdir,
+                        workdir=low_dir,
+                        tag=f"expected_uniform_sig{sigma_c}",
+                        weights_txt=weights_txt,
+                        weighted=True
+                    )
+                cand = alg1_low_cache[sigma_c]
+
+            a2, a3 = run_postfilters(
+                expected_filtered=cand,
+                weights_txt=weights_txt,
+                owner_txt=owner_txt,
+                theta=th,
+                st=sigma,
+                workdir=alg23_dir,
+                tag="expected_uniform"
+            )
+            alg2_paths[f"alg2_theta{th}"] = a2
+            alg3_paths[f"alg3_theta{th}"] = a3
+
+    analysis_dir = outdir / "analysis"
+    ensure_dir(analysis_dir)
+
+    if args.single_tree_only:
+        result_paths = {"alg0_mastro_random": alg0_filtered}
+    else:
+        result_paths = {
+            "alg0_mastro_random": alg0_filtered,
+            "alg1_expected_uniform": alg1_filtered,
+            **alg2_paths,
+            **alg3_paths,
+        }
+    compare_results(result_paths, analysis_dir)
+
+    if args.significance:
+        sig_dir = outdir / "significance"
+        ensure_dir(sig_dir)
+        # In --npy mode: npy_path/npy_sampled_path are set, graphs_all_path is None
+        # In --graphs mode: vice-versa
+        graphs_all_path = None if npy_path else graphs_all
+        graphs_sampled_path = None if npy_path else graphs_sampled
+        run_significance_tests(
+            sig_dir=sig_dir,
+            npy_path=npy_path,
+            npy_sampled_path=npy_sampled_path,
+            graphs_all_path=graphs_all_path,
+            graphs_sampled_path=graphs_sampled_path,
+            weights_txt=weights_txt,
+            owner_txt=owner_txt,
+            weights_sampled_txt=weights_sampled_txt,
+            owner_sampled_txt=owner_sampled_txt,
+            alg0_filtered=alg0_filtered,
+            alg1_filtered=alg1_filtered,
+            alg2_paths=alg2_paths,
+            alg3_paths=alg3_paths,
+            thetas=thetas,
+            null_model=args.sig_null,
+            mc_cutoff=args.sig_mc_cutoff,
+            mc_samples=args.sig_mc_samples,
+            seed=args.seed,
+            n_jobs=args.sig_n_jobs,
+            single_tree_only=args.single_tree_only,
+            exact_when_cheaper=args.sig_exact_when_cheaper,
+        )
+
+    print("\n[DONE] Outputs are under:", outdir)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,210 @@
+"""Calibration: empirical FWER control for the MAESTRI multi-tree tests.
+
+Under the global null (no trajectory is genuinely conserved) every reported
+trajectory is a false discovery, so a correctly calibrated Westfall-Young
+threshold must yield an empirical FWER of at most alpha. This script measures
+that empirical rate for both multi-tree tests.
+
+Protocol:
+  1. Draw a pool of N null datasets with the selected null ('perm', 'indep' or
+     'perm_tree'), mine each, and score both tests on their own family
+     (expected support on the expected-support family, theta-consensus on the
+     theta-maximal family) with run_wy_correction_multitree._run_resample.
+     Unlike run_wy_correction_multitree.py, the null theta family is always
+     mined at sigma, also for theta < 1. Record the minimum p-value of each
+     null dataset, for each test.
+  2. Draw R random splits of the pool into a calibration set of size m (used
+     to fix the WY threshold delta_hat at each alpha) and a disjoint
+     validation set (used to measure the empirical FWER as the fraction of
+     validation datasets whose minimum p-value is <= delta_hat). Reusing one
+     pool across the R splits avoids N*R minings.
+
+Output: empirical_fwer.csv with (test, alpha, m, mean_fwer, std_fwer) and a
+console summary. A well-calibrated procedure gives mean_fwer <= alpha.
+
+Usage
+-----
+    python3 empirical_fwer_multitree.py \
+        --graphs_all inputs/graphs_all.txt \
+        -w inputs/weights.txt --owner inputs/owner.txt \
+        --sigma 2.0 --theta 1.0 --null perm \
+        --n_datasets 200 --m 100 --n_trials 200 \
+        --par 4 --outdir cal_out
+"""
+
+import argparse
+import csv
+from multiprocessing import Pool
+from pathlib import Path
+
+import numpy as np
+
+from utils import SCRIPT_DIR, ensure_dir, load_weights_and_owner, set_verbose
+from utils import wy_threshold as _wy_threshold
+from run_wy_correction_multitree import _run_resample
+
+
+def _min_or_one(vals):
+    return min(vals) if vals else 1.0
+
+
+def wy_threshold(sorted_minima, alpha, m):
+    """WY-corrected threshold of the m calibration minima (tie-aware, see
+    utils.wy_threshold)."""
+    return _wy_threshold(sorted_minima[:m], alpha)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Empirical FWER calibration for the MAESTRI multi-tree tests"
+    )
+    ap.add_argument("--graphs_all", required=True)
+    ap.add_argument("-w", "--weights", required=True)
+    ap.add_argument("--owner", required=True)
+    ap.add_argument("--sigma", type=float, required=True)
+    ap.add_argument("--theta", type=float, default=1.0)
+    ap.add_argument("--null", choices=["perm", "indep", "perm_tree"], default="perm")
+    ap.add_argument("--test", choices=["exp", "theta", "both"], default="both")
+    ap.add_argument("--n_datasets", type=int, default=200,
+                    help="Size N of the null-dataset pool")
+    ap.add_argument("--m", type=int, default=100,
+                    help="Calibration-set size m (< n_datasets)")
+    ap.add_argument("--n_trials", type=int, default=200,
+                    help="Number R of random calibration/validation splits")
+    ap.add_argument("--alphas", default="0.01,0.05,0.1")
+    ap.add_argument("--mc_cutoff", type=int, default=8)
+    ap.add_argument("--mc_samples", type=int, default=10000)
+    ap.add_argument("--exact_when_cheaper", action="store_true",
+                    help="Exact null law above --mc_cutoff when there are at "
+                         "most --mc_samples placements")
+    ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--lcmdir", default=str(SCRIPT_DIR / "lcm53"))
+    ap.add_argument("--par", type=int, default=1)
+    ap.add_argument("--keep", action="store_true",
+                    help="Keep resample working dirs (default: clean up)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Echo every per-dataset subcommand (default: quiet)")
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--workdir", default=None,
+                    help="Scratch directory for the per-dataset mining "
+                         "(default: <outdir>/resamples)")
+    ap.add_argument("--from_pool", action="store_true",
+                    help="Skip the null-dataset pool and rerun only the "
+                         "calibration/validation splits on "
+                         "<outdir>/pool_min_pvalues.csv")
+    args = ap.parse_args()
+
+    if args.m >= args.n_datasets:
+        ap.error("--m must be smaller than --n_datasets")
+
+    set_verbose(args.verbose)
+
+    lcmdir = Path(args.lcmdir).resolve()
+    outdir = Path(args.outdir).resolve()
+    ensure_dir(outdir)
+    alphas = [float(a) for a in args.alphas.split(",") if a.strip()]
+    pool_csv = outdir / "pool_min_pvalues.csv"
+    if args.from_pool:
+        # Splits only, on the pool minima saved by an earlier run
+        pool = np.genfromtxt(pool_csv, delimiter=",", names=True)
+        min_exp, min_theta = pool["min_pval_exp"], pool["min_pval_theta"]
+        if len(min_exp) != args.n_datasets:
+            ap.error(f"{pool_csv} has {len(min_exp)} datasets, not --n_datasets")
+    else:
+        workdir = Path(args.workdir).resolve() if args.workdir else outdir / "resamples"
+        ensure_dir(workdir)
+
+        graphs_path = Path(args.graphs_all).resolve()
+        weights_path = Path(args.weights).resolve()
+        owner_path = Path(args.owner).resolve()
+
+        graphs_lines = [l.rstrip("\n") for l in open(graphs_path)]
+        _, _owner0, n_patients, K = load_weights_and_owner(weights_path, owner_path)
+        assert len(graphs_lines) == K, (
+            f"graphs has {len(graphs_lines)} lines but weights/owner has {K}")
+
+        print(f"[CAL] graphs={graphs_path.name} n_patients={n_patients} K={K}")
+        print(f"[CAL] null={args.null} sigma={args.sigma} theta={args.theta}")
+        print(f"[CAL] pool N={args.n_datasets} m={args.m} trials R={args.n_trials} "
+              f"par={args.par}")
+
+        # Step 1: build the null-dataset pool and record per-dataset minima
+        worker_args = []
+        for r in range(args.n_datasets):
+            # theta_cand_sigma = None: the null theta family is mined at sigma
+            # (see run_wy_correction_multitree._run_resample)
+            worker_args.append((
+                r, graphs_path, weights_path, owner_path,
+                args.sigma, lcmdir, workdir,
+                args.test, args.null, args.theta,
+                args.mc_cutoff, args.mc_samples,
+                args.seed, not args.keep, args.verbose, None,
+                args.exact_when_cheaper,
+            ))
+
+        total = args.n_datasets
+        step = max(1, total // 100)
+        results = []
+        if args.par > 1:
+            with Pool(args.par) as pool:
+                for done, res in enumerate(
+                        pool.imap_unordered(_run_resample, worker_args), 1):
+                    results.append(res)
+                    if done % step == 0 or done == total:
+                        print(f"[CAL] null dataset {done}/{total} done", flush=True)
+        else:
+            for done, wa in enumerate(worker_args, 1):
+                results.append(_run_resample(wa))
+                if done % step == 0 or done == total:
+                    print(f"[CAL] null dataset {done}/{total} done", flush=True)
+        results.sort(key=lambda x: x[0])
+
+        min_exp = np.array([_min_or_one(pv_exp) for _, pv_exp, _ in results])
+        min_theta = np.array([_min_or_one(pv_theta) for _, _, pv_theta in results])
+
+        # Persist the raw pool so the splits can be rerun offline (--from_pool)
+        with pool_csv.open("w") as f:
+            f.write("dataset,min_pval_exp,min_pval_theta\n")
+            for i in range(args.n_datasets):
+                f.write(f"{i},{min_exp[i]:.6e},{min_theta[i]:.6e}\n")
+
+    # Step 2: random calibration/validation splits
+    rng = np.random.default_rng(args.seed + 1)
+    tests = []
+    if args.test in ("exp", "both"):
+        tests.append(("exp", min_exp))
+    if args.test in ("theta", "both"):
+        tests.append(("theta", min_theta))
+
+    rows = []
+    N, m = args.n_datasets, args.m
+    for tname, minima in tests:
+        for alpha in alphas:
+            fwers = []
+            for _ in range(args.n_trials):
+                perm = rng.permutation(N)
+                cal = np.sort(minima[perm[:m]])
+                val = minima[perm[m:]]
+                delta = wy_threshold(cal, alpha, m)
+                fwers.append(float(np.mean(val <= delta)))
+            fwers = np.array(fwers)
+            rows.append({
+                "test": tname, "alpha": f"{alpha:.2f}", "m": m,
+                "mean_fwer": f"{fwers.mean():.4f}",
+                "std_fwer": f"{fwers.std():.4f}",
+            })
+            print(f"[CAL] {tname:5s} alpha={alpha:.2f}  "
+                  f"empirical FWER = {fwers.mean():.4f} +/- {fwers.std():.4f}"
+                  f"   ({'OK' if fwers.mean() <= alpha + fwers.std() else 'CHECK'})")
+
+    out_csv = outdir / "empirical_fwer.csv"
+    with out_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["test", "alpha", "m", "mean_fwer", "std_fwer"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[CAL] written -> {out_csv}")
+
+
+if __name__ == "__main__":
+    main()
